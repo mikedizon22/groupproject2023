@@ -29,6 +29,7 @@ library(here)
 library(tictoc)
 library(vip)
 library(ranger)
+library(rpart.plot)
 ```
 
 # The problem: predicting credit card fraud
@@ -229,7 +230,7 @@ Start with 3 CV folds to quickly get an estimate for the best model and you can 
 ```{r}
 set.seed(123)
 cv_folds <- vfold_cv(data = card_fraud_train, 
-                          v = 3, 
+                          v = 10, 
                           strata = is_fraud)
 cv_folds 
 ```
@@ -246,7 +247,7 @@ fraud_rec <- recipe(is_fraud ~ ., data = card_fraud_train) %>%
   step_novel(all_nominal(), -all_outcomes()) %>% # Use *before* `step_dummy()` so new level is dummified
   step_dummy(all_nominal(), -all_outcomes()) %>% 
   step_zv(all_numeric(), -all_outcomes())  %>% 
-  step_normalize(all_numeric())
+  step_normalize(all_numeric()) 
 
 
 ```
@@ -482,6 +483,7 @@ model_compare <- bind_rows(log_metrics,
                             rf_metrics,
                            xgb_metrics,
                            knn_metrics
+                           
                       ) %>% 
   # get rid of 'sec elapsed' and turn it into a number
   mutate(time = str_sub(time, end = -13) %>% 
@@ -555,6 +557,10 @@ last_fit_xgb %>%
   theme_light()
 
 ```
+
+
+
+
 
 ## Plot Final Confusion matrix and ROC curve
 
@@ -650,3 +656,130 @@ scales::dollar(cost_summary$false_naives - cost_summary$false_negatives - cost_s
 - Our classifier also has some false positives, `r scales::dollar(cost_summary$false_positives)`, namely flagging transactions as fraudulent, but which were legitimate. Assuming the card company makes around 2% for each transaction (source: https://startups.co.uk/payment-processing/credit-card-processing-fees/), the amount of money lost due to these false positives is `r scales::dollar(cost_summary$false_positives * 0.02)`
 
 - The \$ improvement over the naive policy is `r scales::dollar(cost_summary$false_naives - cost_summary$false_negatives - cost_summary$false_positives * 0.02)`.
+
+
+##Appendix: how would the XGBoost Model look if we only take the first 5 variables shown in the variable importance graph
+ 
+ We have decided to run another XGBoost model only with the top 5 variables that added more to the model just to compare it with the initial in case it would be overfitting the data.
+ The variables used were: "mt, category_grocery_pos, hour, category_gas_transport, age". 
+ 
+ However, while plotting the Mean_ROC_AUC, we noticed that it was exactly the same as the initial model, and ergo it wouldn't make a lot of difference to have this model with only 5 variables compared with the original one and finally decided to keep the original one. 
+ 
+ See code below with this new model.
+
+```{r}
+
+##Creating a model using only the top 5 variables:  amt, category_grocery_pos, hour, category_gas_transport, age
+
+#Step1: new recipe only with the 5 variables
+fraud_rec_final <- recipe(is_fraud ~ ., data = card_fraud_train) %>% 
+  step_log(amt) %>% 
+  step_novel(all_nominal(), -all_outcomes()) %>% # Use *before* `step_dummy()` so new level is dummified
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_numeric(), -all_outcomes())  %>% 
+  step_normalize(all_numeric()) %>% 
+  step_select("is_fraud","amt","category_grocery_pos","hour","category_gas_transport","age")
+
+#Step 2: creating the xgb_wflow,  xgb_res and xgb_metrics
+
+xgb_wflow_final <-
+ workflow() %>%
+ add_recipe(fraud_rec_final) %>% 
+ add_model(xgb_spec)
+
+
+tic()
+xgb_res_final <- 
+  xgb_wflow_final %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)
+    )
+time <- toc()
+xgb_time_final <- time[[4]]
+
+
+xgb_metrics_final <- 
+  xgb_res_final %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "XGBoost_Final",
+         time = xgb_time_final)
+
+
+model_compare <- bind_rows(log_metrics,
+                            tree_metrics,
+                            rf_metrics,
+                           xgb_metrics,
+                           knn_metrics,
+                           xgb_metrics_final
+                      ) %>% 
+  
+  mutate(time = str_sub(time, end = -13) %>% 
+           as.double()
+         )
+
+#Pivot wider to create barplot
+  model_comp <- model_compare %>% 
+  select(model, .metric, mean, std_err) %>% 
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err)) 
+
+
+# show mean are under the curve (ROC-AUC) for every model
+model_comp %>% 
+  arrange(mean_roc_auc) %>% 
+  mutate(model = fct_reorder(model, mean_roc_auc)) %>% # order results
+  ggplot(aes(model, mean_roc_auc, fill=model)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues") +
+   geom_text(
+     size = 3,
+     aes(label = round(mean_roc_auc, 2), 
+         y = mean_roc_auc + 0.08),
+     vjust = 1
+  )+
+  theme_light()+
+  theme(legend.position = "none")+
+  labs(y = NULL)
+```
+
+
+##Exploratory Graphs:
+
+```{r}
+"Percentage of fraudulent transactions by type of merchant in % of total"
+card_fraud %>% 
+  filter(is_fraud==1) %>% 
+  count(category) %>% 
+  mutate(freq=n/sum(n)) %>%  #Calculating frequency
+  mutate(category=fct_reorder(category,freq)) %>%  #Rearranging
+  ggplot(aes(y=freq,x=category,fill=category))+geom_col()+theme_minimal()+labs(
+    title="Percentage of fraudulent transactions by type of merchant in % of total",
+    x=NULL,
+    y="Frequency"
+  )+ scale_x_discrete(labels=NULL, breaks=NULL)+ scale_y_continuous(labels = scales::percent, limits=c(0,0.3))
+
+```
+
+```{r}
+#Age intervals of people who were victims in a fraudulent transaction
+card_fraud %>% 
+  filter(is_fraud==1) %>% 
+  mutate(age_interval=case_when(
+    age<=25~"0-25",
+    age<50~"25-50",
+    age<70~"50-70",
+    .default=">70"
+  )) %>% 
+  count(age_interval) %>% 
+  ggplot(aes(x=age_interval,y=n))+geom_col()+theme_minimal()+labs(
+    title="Age intervals of people who were victims in a fraudulent transaction",
+    x="Age",
+    y="Frequency"
+  )
+```
+
